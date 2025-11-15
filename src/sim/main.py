@@ -115,10 +115,13 @@ class MSSPSim:
             zid = "_".join(str(sid) for sid in shard_key)
             # Danh sách shard của zone là list(shard_key)
             zone_shards = list(shard_key)
-            # Gán một mức ưu tiên ngẫu nhiên ban đầu (có thể được điều chỉnh sau)
+            # Khởi tạo mức ưu tiên bằng giá trị tối đa. Bài báo đề xuất đặt
+            # ưu tiên dựa trên số block hợp lệ của mỗi zone trong chu kỳ, thay vì
+            # một số ngẫu nhiên. Ở bước này, ta bắt đầu với priority_max để tất
+            # cả zone có cơ hội ngang nhau và sẽ được điều chỉnh động sau này.
             self.zones[zid] = ConsensusZone(
                 self.env, zid, zone_shards, z_nodes,
-                priority=random.randint(4, 7)
+                priority=self.cfg.sort.priority_max
             )
 
         # --- Network ---
