@@ -1,13 +1,14 @@
 from dataclasses import dataclass, field
 
+
 @dataclass
 class PBFTConfig:
     preprepare_mean: float = 0.10
-    prepare_mean: float    = 0.20
-    commit_mean: float     = 0.20
-    timeout: float         = 0.80     # timeout cho mỗi pha
+    prepare_mean: float = 0.20
+    commit_mean: float = 0.20
+    timeout: float = 0.80     # timeout cho mỗi pha
     viewchange_cost_mean: float = 0.30
-    max_view_changes: int  = 3        # số lần quay vòng leader tối đa
+    max_view_changes: int = 3        # số lần quay vòng leader tối đa
 
 class ConsensusConfig:
     mode: str = "pbft"               # lựa chọn cơ chế đồng thuận
@@ -50,8 +51,16 @@ class SystemConfig:
     malicious_drop_prob: float = 0.40 # xác suất node xấu bỏ phiếu/giấu vote
     shards: int = 4
     nodes_per_shard: int = 8
-    mnode_fraction: float = 0.40      # tỉ lệ node lưu >= 2 shard
+    mnode_fraction: float = 0.40      # tỉ lệ node lưu >= 2 shard (giữ lại để tương thích)
     random_seed: int = 2025
+
+    # --- MSSP multi-shard configuration ---
+    # Số shard tối đa mà mỗi m-node được phép lưu trữ (k trong bài báo). Mặc định = 2.
+    mnode_shard_count: int = 2
+    # Số lượng m-node trong mỗi shard (m trong bài báo). Nếu bằng 0, m sẽ được tính
+    # theo mnode_fraction và nodes_per_shard (m = round(nodes_per_shard * mnode_fraction)).
+    mnode_count_per_shard: int = 0
+
 
 @dataclass
 class Config:
