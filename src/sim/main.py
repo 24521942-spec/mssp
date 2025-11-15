@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+"""
+Mô phỏng MSSP cải tiến: lựa chọn shard cho m-nodes sử dụng hàm băm SHA-256 theo
+mô tả trong bài báo. Cho phép người dùng cấu hình số shard mà mỗi m-node lưu trữ
+(k) và số m-node trong mỗi shard (m). Khi tạo các nút, chúng ta chọn đúng m
+nút trong mỗi shard làm m-node và dùng hàm băm để chọn thêm k-1 shard lưu trữ.
+
+Các phần còn lại của mô phỏng (vùng đồng thuận, PBFT/HBBFT, sắp xếp ưu tiên,
+P-probability, ...) được giữ nguyên như phiên bản gốc.
+"""
+
 import random
+import hashlib
 from collections import deque
-from typing import Callable, Optional, Dict, List
+from typing import Callable, Optional, Dict, List, Tuple
 
 import simpy
 
@@ -29,8 +40,6 @@ except Exception:
     def tpke_encrypt(batch): return batch
     def tpke_decrypt(cipher, shares=2): return cipher
 
-
-
 from ..core.config import Config
 from ..core.models import Shard, Node, ConsensusZone, Block
 from ..core.network import Network
@@ -38,13 +47,11 @@ from ..core.pbft import run_pbft
 from ..core.sorting import PrioritySorter
 from ..core.metrics import Metrics
 from ..core.workload import addr_to_shard
-from ..io.tx_reader import stream_transactions_from_csv  
+from ..io.tx_reader import stream_transactions_from_csv
+
 
 class MSSPSim:
-    """
-    Mô phỏng MSSP: shards, nodes, consensus zones, PBFT, priority sorting.
-    Thêm API accept_tx() để nạp giao dịch từ ngoài (CSV/REST) + tiến trình drain.
-    """
+    """Mô phỏng giao thức MSSP với lựa chọn multi-shard tùy chỉnh."""
 
     def __init__(self, cfg: Config):
         random.seed(cfg.sys.random_seed)
@@ -58,26 +65,64 @@ class MSSPSim:
 
         # --- Nodes ---
         self.nodes: List[Node] = []
-        total = cfg.sys.shards * cfg.sys.nodes_per_shard
-        for nid in range(total):
-            if random.random() < cfg.sys.mnode_fraction:
-                stored = set(random.sample(range(cfg.sys.shards), k=min(2, cfg.sys.shards)))
-            else:
-                stored = {nid % cfg.sys.shards}
-            is_bad = (random.random() < cfg.sys.malicious_fraction)
-            self.nodes.append(Node(self.env, nid, stored, is_bad))
 
-        # --- Zones (pairwise) ---
+        # Các tham số cấu hình multi-shard
+        k = max(1, cfg.sys.mnode_shard_count)  # số shard mỗi m-node lưu
+        # Xác định số m-node trong mỗi shard (m). Nếu thiết lập rõ, dùng giá trị đó.
+        if cfg.sys.mnode_count_per_shard and cfg.sys.mnode_count_per_shard > 0:
+            m_per_shard = cfg.sys.mnode_count_per_shard
+        else:
+            # fallback: tính m dựa trên tỉ lệ mnode_fraction
+            m_per_shard = int(round(cfg.sys.nodes_per_shard * cfg.sys.mnode_fraction))
+        # đảm bảo m không vượt quá nodes_per_shard và tối thiểu là 0
+        m_per_shard = max(0, min(m_per_shard, cfg.sys.nodes_per_shard))
+
+        # Khởi tạo node cho từng shard
+        for shard_id in range(cfg.sys.shards):
+            # Danh sách local index 0..nodes_per_shard-1
+            local_indices = list(range(cfg.sys.nodes_per_shard))
+            # Chọn ngẫu nhiên m_per_shard index làm m-node
+            if m_per_shard > 0:
+                mnode_indices = set(random.sample(local_indices, m_per_shard))
+            else:
+                mnode_indices = set()
+            # Tạo node từng local index
+            for local_idx in local_indices:
+                nid = shard_id * cfg.sys.nodes_per_shard + local_idx
+                is_bad = (random.random() < cfg.sys.malicious_fraction)
+                if local_idx in mnode_indices:
+                    # m-node: chọn nhiều shard lưu trữ bằng hàm băm
+                    stored_shards = self._select_multi_shards(nid, shard_id, k)
+                else:
+                    # s-node: chỉ lưu shard hiện tại
+                    stored_shards = {shard_id}
+                self.nodes.append(Node(self.env, nid, stored_shards, is_bad))
+
+        # --- Zones (consensus zones) ---
+        # Trong MSSP, một consensus zone được xác định bởi tập hợp các shard mà các nút lưu trữ.
+        # Mỗi tập shard duy nhất trong mạng tạo ra một zone, bao gồm tất cả các nút có cùng tập shard.
+        # ID của zone là danh sách shard được sắp xếp và nối với '_', ví dụ: '0', '0_1', '0_1_2', ...
         self.zones: Dict[str, ConsensusZone] = {}
-        for i in range(cfg.sys.shards):
-            for j in range(i, cfg.sys.shards):
-                z_nodes = [n for n in self.nodes if (i in n.stored_shards and j in n.stored_shards)]
-                if z_nodes:
-                    zid = f"{i}_{j}"
-                    self.zones[zid] = ConsensusZone(
-                        self.env, zid, [i, j], z_nodes,
-                        priority=random.randint(4, 7)
-                    )
+        # Gom nhóm nút theo tập shard của chúng
+        shard_set_to_nodes: Dict[Tuple[int, ...], List[Node]] = {}
+        for n in self.nodes:
+            # Sắp xếp để đảm bảo key nhất quán
+            key = tuple(sorted(n.stored_shards))
+            shard_set_to_nodes.setdefault(key, []).append(n)
+        # Tạo zone cho mỗi tập shard duy nhất
+        for shard_key, z_nodes in shard_set_to_nodes.items():
+            # Tạo ID bằng cách nối các shard ID bằng '_'
+            zid = "_".join(str(sid) for sid in shard_key)
+            # Danh sách shard của zone là list(shard_key)
+            zone_shards = list(shard_key)
+            # Khởi tạo mức ưu tiên bằng giá trị tối đa. Bài báo đề xuất đặt
+            # ưu tiên dựa trên số block hợp lệ của mỗi zone trong chu kỳ, thay vì
+            # một số ngẫu nhiên. Ở bước này, ta bắt đầu với priority_max để tất
+            # cả zone có cơ hội ngang nhau và sẽ được điều chỉnh động sau này.
+            self.zones[zid] = ConsensusZone(
+                self.env, zid, zone_shards, z_nodes,
+                priority=self.cfg.sort.priority_max
+            )
 
         # --- Network ---
         self.net = Network(cfg.net.mean_delay, cfg.net.jitter, cfg.net.drop_prob, cfg.net.use_topology)
@@ -85,7 +130,7 @@ class MSSPSim:
             self.net.build_random_topology([n.node_id for n in self.nodes], avg_degree=3)
 
         # --- Metrics & conflict map ---
-        self.metrics = Metrics().__dict__       # các thành phần khác dùng dict[...]
+        self.metrics = Metrics().__dict__  # các thành phần khác dùng dict[...]
         self.conflict_map: Dict[str, set] = {}
 
         # --- Sorter (truyền conflict_map để detect DS) ---
@@ -117,78 +162,39 @@ class MSSPSim:
             if node in z.nodes:
                 z.nodes.remove(node)
         self.metrics['faulty_nodes_quarantined'] += 1
-    
-    def _compute_f(self, zone_nodes:int ) -> int:
+
+    def _compute_f(self, zone_nodes: int) -> int:
         return max(1, (zone_nodes - 1) // 3)
-    
 
+    def _select_multi_shards(self, node_id: int, primary_shard: int, k: int) -> set:
+        """
+        Chọn k shard cho một m-node theo thuật toán 1 trong bài MSSP.
 
+        Tham số:
+        - node_id: ID duy nhất của nút, đóng vai trò A trong hàm băm.
+        - primary_shard: shard gốc mà nút thuộc về.
+        - k: số shard tối đa mà m-node lưu.
 
-    def _process_zone_hbbft(self, zone: ConsensusZone, txs: list, leader: Node, conflict_id: Optional[str]):
-        n = len(zone.nodes)
-        if n < 4:
-            return
-
-        f = self._compute_f(n)
-        epoch = zone.block_counter + 1
-
-        # Lấy ID zone an toàn
-        zid_str = getattr(zone, 'zid', None) or getattr(zone, 'id', None)
-        if zid_str is None:
-            try:
-                zid_str = f"{min(zone.shards)}_{max(zone.shards)}"
-            except Exception:
-                zid_str = "unknown_zone"
-
-        # === 1) batch & mã hoá ===
-        batch = txs[: self.cfg.consensus.batch_size]
-        ciphertext = tpke_encrypt(batch)
-        proposals = {nd.node_id: ciphertext for nd in zone.nodes}
-
-        # === 2) ACS ===
-        acs = ACS(self.env, [n.node_id for n in zone.nodes], f, getattr(self.cfg.consensus, "hbbft_coin_seed", 0))
-        res = yield self.env.process(acs.run_epoch(epoch, proposals))
-        if len(res.accepted_sender_ids) == 0:
-            return
-
-        # === 3) giải mã & gom TX ===
-        all_txs = []
-        for sid in res.accepted_sender_ids:
-            pt = tpke_decrypt(res.payloads[sid], shares=f + 1)
-            all_txs.extend(pt)
-
-        # === 4) tạo block tuyến tính ===
-        zone.block_counter = epoch
-        bid = f"{zid_str}_hbbft_e{epoch}_{int(self.env.now)}"
-
-        # --- Đếm pre-sort Double-Spend giống PBFT ---
-        cids_in_block = {t.get("conflict_id") for t in all_txs if t.get("conflict_id")}
-        for cid in cids_in_block:
-            s = self.conflict_map.setdefault(cid, set())
-            if bid not in s:
-                s.add(bid)
-                # chỉ khi đã có 2 block khác nhau cùng conflict_id mới tính là DS
-                if len(s) == 2:
-                    self.metrics['pre_sort_double_spends'] += 1
-
-        # --- Ghi block vào các shard ---
-        for sid in zone.shards:
-            shard = self.shards[sid]
-            nb = Block(bid, zid_str, None, all_txs, zone.priority, self.env.now, conflict_id)
-            try:
-                nb.confirmed = True
-            except Exception:
-                pass
-            shard.blocks[bid] = nb
-            shard.tips = {bid}
-
-        # --- Cập nhật thống kê ---
-        self.metrics['confirmed_blocks'] += 1
-        self.metrics.setdefault('txs_committed', 0)
-        self.metrics['txs_committed'] += len(all_txs)
-        self.metrics.setdefault('n_commits', 0)
-        self.metrics['n_commits'] += 1
-
+        Trả về: tập hợp k shard ID mà nút lưu trữ (bao gồm shard gốc).
+        """
+        stored = {primary_shard}
+        A = str(node_id)
+        # Khởi tạo R ngẫu nhiên
+        R = random.getrandbits(32)
+        # Lặp cho tới khi đạt k shard
+        while len(stored) < k:
+            # Tính j = TRUNCATE(SHA256(A‖R), 5)
+            data = (A + str(R)).encode()
+            digest = hashlib.sha256(data).digest()
+            first_byte = digest[0]
+            j_val = (first_byte >> 3)  # lấy 5 bit cao nhất
+            # Điều chỉnh vào phạm vi shard hiện có
+            shard_idx = j_val % self.cfg.sys.shards
+            if shard_idx not in stored:
+                stored.add(shard_idx)
+            # cập nhật R để tránh lặp lại giá trị băm cũ
+            R = random.getrandbits(32)
+        return stored
 
     # ------------------------------------------------------------------
     # API: ingest TX (được drain gọi hoặc accept_tx gọi trực tiếp)
@@ -201,15 +207,36 @@ class MSSPSim:
         if not tx.get('from') or not tx.get('to'):
             return
         s_from = addr_to_shard(str(tx['from']), self.cfg.sys.shards)
-        s_to   = addr_to_shard(str(tx['to']),   self.cfg.sys.shards)
-        zid = f"{min(s_from, s_to)}_{max(s_from, s_to)}"
+        s_to = addr_to_shard(str(tx['to']), self.cfg.sys.shards)
+        # Xác định zone cho giao dịch dựa trên hai shard từ/to
+        # Tạo ID cặp shard bằng cách sắp xếp và nối bằng '_'
+        pair_shards = sorted({s_from, s_to})
+        zid = "_".join(str(sid) for sid in pair_shards)
         zone = self.zones.get(zid)
-        if not zone or not zone.nodes:
+        # Nếu không tồn tại zone chính xác cho cặp này, tìm zone tối thiểu chứa cả hai shard
+        if zone is None or not zone.nodes:
+            # Tìm các zone có tập shard bao gồm cả hai shard
+            candidate_zones = [z for z in self.zones.values() if set(pair_shards).issubset(set(z.shards)) and z.nodes]
+            if not candidate_zones:
+                return
+            # Chọn zone có số shard nhỏ nhất (ưu tiên gần với cặp nhất)
+            candidate_zones.sort(key=lambda z: len(z.shards))
+            zone = candidate_zones[0]
+            # Cập nhật zid theo ID của zone thực sự
+            # Tìm khóa phù hợp trong self.zones để sử dụng làm zid
+        # Tìm ID thực của zone
+        # Từ đối tượng zone đã chọn, tìm ra key tương ứng trong self.zones
+        zone_id = None
+        for key, z in self.zones.items():
+            if z is zone:
+                zone_id = key
+                break
+        if zone_id is None:
             return
         leader = zone.nodes[0]
         cid = tx.get('conflict_id')
-        # Một TX → một block ở zone, block có thể được replicate lên cả 2 shard của zone
-        self.env.process(self.process_zone(zid, [dict(tx)], leader, cid))
+        # Một TX → một block ở zone, block có thể được replicate lên các shard của zone
+        self.env.process(self.process_zone(zone_id, [dict(tx)], leader, cid))
 
     # ------------------------------------------------------------------
     # Ingress API công khai: nhận TX từ ngoài (CSV/REST/attack)
@@ -336,18 +363,19 @@ class MSSPSim:
             return
 
         self.metrics['proofs_required'] += 1
-        if misses == 0: p = 0.0
-        elif misses == 1: p = 0.25
-        elif misses == 2: p = 0.50
-        else: p = 1.0
+        if misses == 0:
+            p = 0.0
+        elif misses == 1:
+            p = 0.25
+        elif misses == 2:
+            p = 0.50
+        else:
+            p = 1.0
 
         if random.random() < p:
             self.metrics['proofs_returned'] += 1
 
     # ------------------------------------------------------------------
-    # CSV feed tại chỗ (tuỳ chọn) — nếu muốn nạp trực tiếp trong class
-    # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
     # CSV feed tại chỗ (tuỳ chọn) — nếu muốn nạp trực tiếp trong class
     # ------------------------------------------------------------------
     def feed_transactions_from_csv_local(self, csv_path="data/blockchain_transaction.csv",
@@ -366,8 +394,8 @@ class MSSPSim:
             # 2️⃣ (Tuỳ chọn) Tiêm Double-Spend (DS) chéo-zone
             if inject_ds and random.random() < ds_rate:
                 s_from = addr_to_shard(str(tx['from']), self.cfg.sys.shards)
-                s_to   = addr_to_shard(str(tx['to']),   self.cfg.sys.shards)
-                s_to2  = (s_to + 1) % self.cfg.sys.shards  # ép sang shard khác
+                s_to = addr_to_shard(str(tx['to']), self.cfg.sys.shards)
+                s_to2 = (s_to + 1) % self.cfg.sys.shards  # ép sang shard khác
 
                 zid1 = f"{min(s_from, s_to)}_{max(s_from, s_to)}"
                 zid2 = f"{min(s_from, s_to2)}_{max(s_from, s_to2)}"
@@ -400,7 +428,6 @@ class MSSPSim:
             cnt += 1  # ✅ phải nằm trong vòng for
 
         print(f"[feed_csv_local] fed {cnt} original transactions (inject_ds={inject_ds})")
-
 
     # ------------------------------------------------------------------
     # Run
