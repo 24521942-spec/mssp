@@ -13,7 +13,7 @@ P-probability, ...) được giữ nguyên như phiên bản gốc.
 import random
 import hashlib
 from collections import deque
-from typing import Callable, Optional, Dict, List
+from typing import Callable, Optional, Dict, List, Tuple
 
 import simpy
 
@@ -98,17 +98,28 @@ class MSSPSim:
                     stored_shards = {shard_id}
                 self.nodes.append(Node(self.env, nid, stored_shards, is_bad))
 
-        # --- Zones (pairwise) ---
+        # --- Zones (consensus zones) ---
+        # Trong MSSP, một consensus zone được xác định bởi tập hợp các shard mà các nút lưu trữ.
+        # Mỗi tập shard duy nhất trong mạng tạo ra một zone, bao gồm tất cả các nút có cùng tập shard.
+        # ID của zone là danh sách shard được sắp xếp và nối với '_', ví dụ: '0', '0_1', '0_1_2', ...
         self.zones: Dict[str, ConsensusZone] = {}
-        for i in range(cfg.sys.shards):
-            for j in range(i, cfg.sys.shards):
-                z_nodes = [n for n in self.nodes if (i in n.stored_shards and j in n.stored_shards)]
-                if z_nodes:
-                    zid = f"{i}_{j}"
-                    self.zones[zid] = ConsensusZone(
-                        self.env, zid, [i, j], z_nodes,
-                        priority=random.randint(4, 7)
-                    )
+        # Gom nhóm nút theo tập shard của chúng
+        shard_set_to_nodes: Dict[Tuple[int, ...], List[Node]] = {}
+        for n in self.nodes:
+            # Sắp xếp để đảm bảo key nhất quán
+            key = tuple(sorted(n.stored_shards))
+            shard_set_to_nodes.setdefault(key, []).append(n)
+        # Tạo zone cho mỗi tập shard duy nhất
+        for shard_key, z_nodes in shard_set_to_nodes.items():
+            # Tạo ID bằng cách nối các shard ID bằng '_'
+            zid = "_".join(str(sid) for sid in shard_key)
+            # Danh sách shard của zone là list(shard_key)
+            zone_shards = list(shard_key)
+            # Gán một mức ưu tiên ngẫu nhiên ban đầu (có thể được điều chỉnh sau)
+            self.zones[zid] = ConsensusZone(
+                self.env, zid, zone_shards, z_nodes,
+                priority=random.randint(4, 7)
+            )
 
         # --- Network ---
         self.net = Network(cfg.net.mean_delay, cfg.net.jitter, cfg.net.drop_prob, cfg.net.use_topology)
@@ -194,14 +205,35 @@ class MSSPSim:
             return
         s_from = addr_to_shard(str(tx['from']), self.cfg.sys.shards)
         s_to = addr_to_shard(str(tx['to']), self.cfg.sys.shards)
-        zid = f"{min(s_from, s_to)}_{max(s_from, s_to)}"
+        # Xác định zone cho giao dịch dựa trên hai shard từ/to
+        # Tạo ID cặp shard bằng cách sắp xếp và nối bằng '_'
+        pair_shards = sorted({s_from, s_to})
+        zid = "_".join(str(sid) for sid in pair_shards)
         zone = self.zones.get(zid)
-        if not zone or not zone.nodes:
+        # Nếu không tồn tại zone chính xác cho cặp này, tìm zone tối thiểu chứa cả hai shard
+        if zone is None or not zone.nodes:
+            # Tìm các zone có tập shard bao gồm cả hai shard
+            candidate_zones = [z for z in self.zones.values() if set(pair_shards).issubset(set(z.shards)) and z.nodes]
+            if not candidate_zones:
+                return
+            # Chọn zone có số shard nhỏ nhất (ưu tiên gần với cặp nhất)
+            candidate_zones.sort(key=lambda z: len(z.shards))
+            zone = candidate_zones[0]
+            # Cập nhật zid theo ID của zone thực sự
+            # Tìm khóa phù hợp trong self.zones để sử dụng làm zid
+        # Tìm ID thực của zone
+        # Từ đối tượng zone đã chọn, tìm ra key tương ứng trong self.zones
+        zone_id = None
+        for key, z in self.zones.items():
+            if z is zone:
+                zone_id = key
+                break
+        if zone_id is None:
             return
         leader = zone.nodes[0]
         cid = tx.get('conflict_id')
-        # Một TX → một block ở zone, block có thể được replicate lên cả 2 shard của zone
-        self.env.process(self.process_zone(zid, [dict(tx)], leader, cid))
+        # Một TX → một block ở zone, block có thể được replicate lên các shard của zone
+        self.env.process(self.process_zone(zone_id, [dict(tx)], leader, cid))
 
     # ------------------------------------------------------------------
     # Ingress API công khai: nhận TX từ ngoài (CSV/REST/attack)
