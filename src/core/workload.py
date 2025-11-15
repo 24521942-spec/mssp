@@ -1,4 +1,3 @@
-# src/core/workload.py
 from typing import Callable, Optional
 import simpy
 import random

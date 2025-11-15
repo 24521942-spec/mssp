@@ -1,6 +1,8 @@
 # src/io/tx_reader.py
 # Đọc CSV lớn (1.7 GB) an toàn bộ nhớ, chặn DtypeWarning, hỗ trợ sample
 # và có adapter tự tìm API nạp giao dịch vào simulator (accept/enqueue/add/...).
+# BẢN NÀY có tiêm double-spend CHÉO ZONE (ép 'to' map sang shard khác)
+# để đánh giá DS cho cả PBFT và HBBFT.
 
 from __future__ import annotations
 import random
@@ -9,6 +11,9 @@ import warnings
 
 import pandas as pd
 from pandas.errors import DtypeWarning
+
+# map địa chỉ -> shard để ép DS sang zone khác
+from src.core.workload import addr_to_shard
 
 # Tắt cảnh báo kiểu dữ liệu lẫn lộn của pandas
 warnings.simplefilter("ignore", DtypeWarning)
@@ -148,6 +153,20 @@ def _resolve_tx_sink(sim):
         "Hãy bổ sung accept_tx()/enqueue_tx() cho MSSPSim hoặc mempool/workload."
     )
 
+# --- helper: ép địa chỉ 'to' rơi vào shard mong muốn (để DS chéo zone) ---
+def _find_addr_for_shard(base: str, target_shard: int, n_shards: int, max_tries: int = 5000) -> str:
+    """
+    Tạo biến thể của 'base' để addr_to_shard(...) == target_shard.
+    Dùng brute-force nhẹ nhàng (đủ cho mô phỏng).
+    """
+    base = base or "0xdeadbeef"
+    for k in range(max_tries):
+        cand = f"{base}_z{k}"
+        if addr_to_shard(cand, n_shards) == target_shard:
+            return cand
+    # fallback: trả về base nếu không tìm thấy
+    return base
+
 def feed_transactions_from_csv(
     sim,                               # MSSPSim instance
     csv_path: str,
@@ -162,11 +181,16 @@ def feed_transactions_from_csv(
 ) -> int:
     """
     Nạp trực tiếp vào mô phỏng (mempool) từ CSV lớn, có tuỳ chọn inject double-spend nhẹ.
+    - inject_ds=True: với xác suất ds_rate, tạo 2 tx có cùng conflict_id,
+      trong đó **bản thứ hai** bị ép 'to' sang **shard khác** -> DS chéo zone.
     Trả về: tổng số giao dịch đã nạp (bao gồm cả bản sao conflict nếu inject_ds=True).
     """
     rng = random.Random(rng_seed)
     fed = 0
     tx_sink = _resolve_tx_sink(sim)
+
+    # số shard trong hệ để ép sang shard khác
+    n_shards = getattr(sim.cfg.sys, "shards", 4)
 
     for tx in stream_transactions(
         csv_path,
@@ -176,15 +200,30 @@ def feed_transactions_from_csv(
         usecols=usecols,
         rng_seed=rng_seed,
     ):
+        # nạp TX gốc
         tx_sink(tx)
         fed += 1
 
-        # (tuỳ chọn) bơm thêm giao dịch conflict (double-spend)
+        # (tuỳ chọn) bơm thêm giao dịch conflict CHÉO ZONE
         if inject_ds and ds_rate > 0.0 and rng.random() < ds_rate:
-            ds_tx = dict(tx)
-            ds_tx["to"] = f"{tx['to']}_ALT"  # đổi người nhận để tạo xung đột
-            tx_sink(ds_tx)
-            fed += 1
+            try:
+                s_to = addr_to_shard(str(tx.get("to","")), n_shards)
+                # ép sang shard khác
+                target_shard = (s_to + 1) % n_shards
+                alt_to = _find_addr_for_shard(str(tx.get("to","")), target_shard, n_shards)
+
+                cid = f"csvds_{rng_seed}_{fed}_{rng.randint(1000,9999)}"
+                ds_tx1 = dict(tx); ds_tx1["conflict_id"] = cid
+                ds_tx2 = dict(tx); ds_tx2["to"] = alt_to; ds_tx2["conflict_id"] = cid
+
+                tx_sink(ds_tx1); fed += 1
+                tx_sink(ds_tx2); fed += 1
+            except Exception:
+                # nếu lỗi mapping, fallback: bơm 1 bản xung đột cùng zone
+                ds_tx = dict(tx)
+                ds_tx["to"] = f"{tx.get('to','')}_ALT"
+                ds_tx["conflict_id"] = f"csvds_{rng_seed}_{fed}_{rng.randint(1000,9999)}"
+                tx_sink(ds_tx); fed += 1
 
     print(f"[feed_csv] fed {fed} transactions (inject_ds={inject_ds})")
     return fed

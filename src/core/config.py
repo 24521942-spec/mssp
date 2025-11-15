@@ -1,4 +1,3 @@
-# src/core/config.py
 from dataclasses import dataclass, field
 
 @dataclass
@@ -9,6 +8,16 @@ class PBFTConfig:
     timeout: float         = 0.80     # timeout cho mỗi pha
     viewchange_cost_mean: float = 0.30
     max_view_changes: int  = 3        # số lần quay vòng leader tối đa
+
+class ConsensusConfig:
+    mode: str = "pbft"               # lựa chọn cơ chế đồng thuận
+    batch_size: int = 200             # số giao dịch trong một khối
+    epoch_timeout: float = 0.0       # timeout cho mỗi epoch (sử dụng trong PoW/PoS)
+
+    hbbft_max_parallel: int = 16   # số instance HBBFT song song (chỉ dùng khi mode="hbbft")
+    hbbft_coin_seed: int = 2025          # seed cho đồng thuận ngẫu nhiên trong HBBFT
+    hbbft_min_accepted: int = 1
+
 
 @dataclass
 class NetworkConfig:
@@ -53,3 +62,4 @@ class Config:
     pprob: PProbConfig = field(default_factory=PProbConfig)
     atk: AttackConfig = field(default_factory=AttackConfig)
     sys: SystemConfig = field(default_factory=SystemConfig)
+    consensus: ConsensusConfig = field(default_factory=ConsensusConfig)
