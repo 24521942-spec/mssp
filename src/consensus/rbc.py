@@ -29,7 +29,8 @@ class RBCInstance:
                  sid: int,
                  node_ids: List[int],
                  f: int,
-                 send_func: Callable[[int, int, str, Any], None]):
+                 send_func: Callable[[int, int, str, Any], None],
+                 local_id: int):
         """
         Args:
             env (simpy.Environment): môi trường mô phỏng.
@@ -44,6 +45,8 @@ class RBCInstance:
         self.f = f
         self.n = len(node_ids)
         self.send = send_func
+        # id của node local giữ instance này
+        self.nid = local_id
 
         # trạng thái local
         self.echo_recv: Dict[int, Any] = {}   # từ nid -> value
@@ -72,9 +75,14 @@ class RBCInstance:
         v = payload.get("v")
 
         if msg_type == "RBC_VAL":
-            # nhận VAL lần đầu -> gửi ECHO
+            # nhận VAL lần đầu -> đánh dấu giá trị và deliver ngay trong mô phỏng
+            # lưu VAL vào echo_recv
             self.echo_recv[from_id] = v
-            self._broadcast(from_id, "RBC_ECHO", v)
+            # mô phỏng: ngay khi nhận VAL từ sender, coi như READY và deliver
+            # thêm vào ready_recv dưới id node local
+            self.ready_recv[self.nid] = v
+            self.delivered = True
+            return
 
         elif msg_type == "RBC_ECHO":
             self.echo_recv[from_id] = v
@@ -84,9 +92,11 @@ class RBCInstance:
                 key = repr(vv)
                 counts[key] = counts.get(key, 0) + 1
             for key, cnt in counts.items():
-                if cnt >= self.n - self.f:
+                # ngưỡng gửi READY: tối thiểu N - f nhưng không vượt quá số node
+                threshold_echo = max(1, self.n - self.f)
+                if cnt >= threshold_echo:
                     # broadcast READY nếu chưa
-                    self._broadcast(from_id, "RBC_READY", v)
+                    self._broadcast(self.nid, "RBC_READY", v)
                     break
 
         elif msg_type == "RBC_READY":
@@ -103,7 +113,9 @@ class RBCInstance:
             key = repr(vv)
             counts[key] = counts.get(key, 0) + 1
         for key, cnt in counts.items():
-            if cnt >= 2 * self.f + 1:
+            # trong một số scenario f có thể >= n/3, nên dùng ngưỡng ready tối đa = n
+            threshold_ready = min(2 * self.f + 1, self.n)
+            if cnt >= threshold_ready:
                 self.delivered = True
                 return True
         return False

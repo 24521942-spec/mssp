@@ -53,7 +53,8 @@ class ACS:
         for sid in node_ids:
             self.rbc[sid] = {}
             for nid in node_ids:
-                self.rbc[sid][nid] = RBCInstance(env, sid, node_ids, f, send_func)
+                # khởi tạo RBC instance cho sender sid tại node nid
+                self.rbc[sid][nid] = RBCInstance(env, sid, node_ids, f, send_func, local_id=nid)
 
             self.aba[sid] = ABAInstance(env,
                                          inst_id=f"ABA_{sid}",

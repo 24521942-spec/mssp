@@ -512,38 +512,6 @@ class MSSPSim:
         if random.random() < p:
             self.metrics['proofs_returned'] += 1
     
-    def _send_consensus_msg(self,
-                            zid: str,
-                            src_id: int,
-                            dst_id: int,
-                            msg_type: str,
-                            payload: Any):
-        """
-        Gửi 1 thông điệp consensus (RBC/ABA/COIN/ACS) của HBBFT:
-          - Lấy delay từ Network
-          - Mô phỏng rơi gói
-          - Nếu nhận được thì chuyển tiếp vào HoneyBadgerZone tương ứng.
-        """
-        # nếu zone không có HBBFT thì bỏ
-        hb_zone = self.hbbft_zones.get(zid)
-        if hb_zone is None:
-            return
-
-        delay = self.net.sample_delay(src_id=src_id, dst_id=dst_id)
-
-        def _deliver():
-            # 1) chờ độ trễ
-            yield self.env.timeout(delay)
-
-            # 2) có thể bị drop
-            if self.net.should_drop():
-                return
-
-            # 3) chuyển message vào HBBFT của zone
-            hb_zone.on_consensus_message(src_id, dst_id, msg_type, payload)
-
-        # đăng ký process trong SimPy
-        self.env.process(_deliver())
 
 
     # ------------------------------------------------------------------
