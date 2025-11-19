@@ -1,10 +1,26 @@
-# src/consensus/acs.py
+"""
+Atomic Common Subset (ACS) protocol cho HoneyBadgerBFT.
+
+ACS phối hợp nhiều phiên broadcast tin cậy (RBC) và binary agreement (ABA)
+để tất cả các node đồng thuận trên một tập con chung các đề xuất. Mỗi
+proposer i sẽ thực hiện RBC_i để phát tán ciphertext của mình, sau đó
+chạy ABA_i để quyết định xem ciphertext đó có được đưa vào tập kết quả
+hay không. Khi ít nhất n−f phiên ABA output 1, các phiên còn lại sẽ
+được feed input 0. Kết quả cuối cùng là tập con những ciphertext có
+ABA=1.
+
+Trong mô phỏng này, ACS chạy từ góc nhìn của một node duy nhất (zone
+controller) và giữ trạng thái cục bộ cho tất cả RBC_i và ABA_i. Việc xử
+lý message được thực hiện thông qua handle_message, tương thích với
+network.
+"""
+
 import simpy
 from typing import Dict, List, Any, Callable
 
 from .rbc import RBCInstance
 from .aba import ABAInstance
-from .coin import CommonCoin  # em phải có 1 common coin mô phỏng
+from .coin import CommonCoin
 
 
 class ACS:
@@ -40,10 +56,10 @@ class ACS:
                 self.rbc[sid][nid] = RBCInstance(env, sid, node_ids, f, send_func)
 
             self.aba[sid] = ABAInstance(env,
-                                        inst_id=f"ABA_{sid}",
-                                        node_ids=node_ids,
-                                        f=f,
-                                        coin=self.coin)
+                                         inst_id=f"ABA_{sid}",
+                                         node_ids=node_ids,
+                                         f=f,
+                                         coin=self.coin)
 
     # ==== interface để node i "propose" giá trị ====
 
@@ -64,7 +80,7 @@ class ACS:
                 self.rbc[sid][to_id].handle_message(from_id, msg_type, payload)
 
         elif msg_type.startswith("ABA_"):
-            # em tự định nghĩa format msg_type/payload cho ABA
+            # payload phải chứa inst để xác định ABA instance
             inst = self.aba.get(payload.get("inst"))
             if inst:
                 inst.handle_message(from_id, msg_type, payload)
@@ -107,10 +123,8 @@ class ACS:
         while True:
             yield self.env.timeout(0.01)
             self._maybe_feed_aba_inputs()
-
             if all(self.aba[sid].has_output() for sid in self.node_ids):
                 break
-
         chosen: Dict[int, Any] = {}
         for sid in self.node_ids:
             if self.aba[sid].get_output() == 1:
