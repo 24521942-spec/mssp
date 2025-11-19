@@ -18,6 +18,10 @@ class ConsensusConfig:
     hbbft_max_parallel: int = 16   # số instance HBBFT song song (chỉ dùng khi mode="hbbft")
     hbbft_coin_seed: int = 2025          # seed cho đồng thuận ngẫu nhiên trong HBBFT
     hbbft_min_accepted: int = 1
+    
+    enable_cross_shard_batching: bool = True   # bật/tắt batching cross-shard
+    cross_shard_batch_size: int = 20          # số tx tối đa trong 1 batch (giữa 1 cặp shard)
+    cross_shard_batch_timeout: float = 0.1  
 
 
 @dataclass

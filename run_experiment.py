@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
-Chạy batch thí nghiệm MSSP với PBFT vs HBBFT.
+run_ds_experiments.py
 
-Scenario:
-    - S1_baseline : mạng tốt, không inject double-spend
-    - S2_A..D     : network stress (tăng delay, jitter, drop)
-    - S3_E..H     : Byzantine + double-spend stress
-    - S4_1..2     : breakdown (mạng cực xấu, để lộ điểm mạnh HBBFT)
+So sánh PBFT vs HBBFT về khả năng chống double-spending trong MSSP.
 
-Kết quả được append vào file CSV: results.csv
+Chạy:
+    python run_ds_experiments.py
 
-Chạy từ thư mục gốc repo:
-
-    python run_batch_experiments.py
+Kết quả được ghi vào: ds_results.csv
 """
 
 import os
@@ -20,7 +15,6 @@ import sys
 import csv
 from typing import Dict, Any, List
 
-# Bảo đảm import được src.*
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
@@ -28,25 +22,21 @@ if ROOT_DIR not in sys.path:
 from src.core.config import Config
 from src.sim.main import MSSPSim
 
-
-# ===== CẤU HÌNH CHUNG =====
-
-# Seed để lặp lại thí nghiệm (nên >= 5, có thể tăng 10, 20 nếu muốn)
+# chạy 5 seed để có trung bình
 SEEDS = [1, 2, 3, 4, 5]
 
-# Thời gian mô phỏng & số TX nạp từ CSV
+# thời gian mô phỏng & nguồn dữ liệu
 DURATION = 60.0
 MAX_TX = 5000
 CSV_PATH = "data/blockchain_transaction.csv"
 
-# File kết quả
-RESULTS_PATH = "results.csv"
+# file kết quả
+RESULTS_PATH = "ds_results.csv"
 
 
 def build_base_config() -> Config:
     """
-    Tạo Config với các tham số MSSP cơ bản.
-    Các scenario bên dưới sẽ override lên các field này.
+    Tạo cấu hình MSSP cơ bản. Các scenario sẽ override lên.
     """
     cfg = Config()
 
@@ -58,7 +48,7 @@ def build_base_config() -> Config:
     cfg.sys.mnode_shard_count = 2
     cfg.sys.mnode_count_per_shard = 0  # 0 = dùng mnode_fraction
 
-    # Network (baseline)
+    # Network (mặc định tốt)
     cfg.net.mean_delay = 0.5
     cfg.net.jitter = 0.2
     cfg.net.drop_prob = 0.0
@@ -77,6 +67,25 @@ def build_base_config() -> Config:
     return cfg
 
 
+def adjust_config_for_hbbft(cfg: Config) -> None:
+    """
+    Đảm bảo điều kiện n >= 3f + 1 cho HBBFT (theo lý thuyết HoneyBadgerBFT).
+    """
+    f = int(cfg.sys.nodes_per_shard * cfg.sys.malicious_fraction)
+    if cfg.sys.malicious_fraction > 0 and f == 0:
+        f = 1
+    min_n = 3 * f + 1
+    if cfg.sys.nodes_per_shard < min_n:
+        cfg.sys.nodes_per_shard = min_n
+
+    # Nếu có tham số batch_size cho HBBFT thì chỉnh lại cho hợp lý
+    try:
+        cfg.consensus.hbbft_batch_size = max(16, cfg.sys.nodes_per_shard * 2)
+    except AttributeError:
+        # nếu không có field này thì bỏ qua
+        pass
+
+
 def run_single_sim(
     mode: str,
     scenario_id: str,
@@ -88,23 +97,18 @@ def run_single_sim(
     """
     Chạy 1 lần mô phỏng với:
       - mode: 'pbft' hoặc 'hbbft'
-      - scenario_id: nhãn scenario (vd 'S1_baseline', 'S2_B', 'S4_1')
-      - seed: random_seed cho hệ thống
-      - cfg_overrides: dict override lên Config (vd {'net.mean_delay': 2.0})
-      - inject_ds, ds_rate: tham số tiêm double-spend khi nạp CSV
+      - scenario_id: nhãn scenario (vd 'S1_baseline', 'S3_heavy_byz')
+      - seed: random seed
+      - cfg_overrides: dict override lên Config
+      - inject_ds / ds_rate: cấu hình tấn công double-spend
 
-    Trả về: dict chứa thông tin config + metrics để ghi ra CSV.
+    Trả về 1 dict (sẽ ghi vào CSV).
     """
     cfg = build_base_config()
-
-    # Gán seed
     cfg.sys.random_seed = seed
-
-    # Chọn mode consensus
     cfg.consensus.mode = mode
 
-    # Áp dụng override cho scenario
-    # key dạng 'net.mean_delay', 'sys.malicious_fraction', ...
+    # áp dụng override kiểu "net.mean_delay", "sys.malicious_fraction", ...
     for key, value in cfg_overrides.items():
         parts = key.split(".")
         obj = cfg
@@ -112,7 +116,10 @@ def run_single_sim(
             obj = getattr(obj, attr)
         setattr(obj, parts[-1], value)
 
-    # Khởi tạo simulator
+    # nếu là HBBFT thì chỉnh lại n >= 3f+1
+    if mode.lower() == "hbbft":
+        adjust_config_for_hbbft(cfg)
+
     sim = MSSPSim(cfg)
 
     print(
@@ -122,7 +129,7 @@ def run_single_sim(
 
     max_tx = None if (MAX_TX is None or MAX_TX <= 0) else MAX_TX
 
-    # Nạp TX từ CSV vào simulator
+    # nạp giao dịch + tiêm double-spend (nếu có)
     sim.feed_transactions_from_csv_local(
         csv_path=CSV_PATH,
         max_tx=max_tx,
@@ -137,10 +144,9 @@ def run_single_sim(
     )
     sim.run(duration=DURATION)
 
-    # Metrics (sim.metrics hiện đang là dict)
     metrics = sim.metrics.copy()
 
-    # Gom thông tin chung
+    # Thông tin config + attack
     row: Dict[str, Any] = {
         "scenario": scenario_id,
         "mode": mode,
@@ -160,7 +166,10 @@ def run_single_sim(
         "ds_rate": ds_rate,
     }
 
-    # Thêm metrics.*
+    # Gộp metrics.* (ví dụ:
+    #  metrics.pre_sort_double_spends
+    #  metrics.post_sort_double_spends
+    #  metrics.pbft_success / metrics.hbbft_success, v.v.)
     for k, v in metrics.items():
         row[f"metrics.{k}"] = v
 
@@ -169,13 +178,16 @@ def run_single_sim(
 
 def append_rows_to_csv(path: str, rows: List[Dict[str, Any]]):
     """
-    Append các dòng vào CSV. Nếu file chưa tồn tại thì ghi header trước.
+    Ghi list dict vào CSV. Nếu file chưa có thì thêm header.
     """
     if not rows:
         return
 
     file_exists = os.path.exists(path)
-    fieldnames: List[str] = sorted(rows[0].keys())
+    all_keys = set()
+    for r in rows:
+        all_keys.update(r.keys())
+    fieldnames = sorted(all_keys)
 
     with open(path, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -188,113 +200,84 @@ def append_rows_to_csv(path: str, rows: List[Dict[str, Any]]):
 def main():
     all_rows: List[Dict[str, Any]] = []
 
-    # ========= Scenario 1: Baseline =========
-    # Mạng tương đối tốt, không inject double-spend
-    scenario_id = "S1_baseline"
-    cfg_overrides_s1 = {
+    # ===== S1: baseline – không Byzantine, không double-spend, mạng tốt =====
+    cfg_s1 = {
         "net.mean_delay": 0.5,
         "net.jitter": 0.2,
         "net.drop_prob": 0.0,
-        "sys.malicious_fraction": 0.2,
+        "sys.malicious_fraction": 0.0,
     }
-
     for mode in ["pbft", "hbbft"]:
         for seed in SEEDS:
             row = run_single_sim(
                 mode=mode,
-                scenario_id=scenario_id,
+                scenario_id="S1_baseline",
                 seed=seed,
-                cfg_overrides=cfg_overrides_s1,
+                cfg_overrides=cfg_s1,
                 inject_ds=False,
                 ds_rate=0.0,
             )
             all_rows.append(row)
 
-    # ========= Scenario 2: Network stress =========
-    # Tăng dần delay, jitter, drop_prob
-    net_cases_s2 = [
-        ("S2_A", 0.5, 0.2, 0.0),
-        ("S2_B", 1.0, 0.5, 0.05),
-        ("S2_C", 2.0, 1.0, 0.10),
-        ("S2_D", 3.0, 1.5, 0.20),
-    ]
+    # ===== S2: Byzantine nhẹ + DS rate thấp =====
+    cfg_s2 = {
+        "net.mean_delay": 1.0,
+        "net.jitter": 0.5,
+        "net.drop_prob": 0.05,
+        "sys.malicious_fraction": 0.1,
+    }
+    for mode in ["pbft", "hbbft"]:
+        for seed in SEEDS:
+            row = run_single_sim(
+                mode=mode,
+                scenario_id="S2_light_byz",
+                seed=seed,
+                cfg_overrides=cfg_s2,
+                inject_ds=True,
+                ds_rate=0.001,
+            )
+            all_rows.append(row)
 
-    for scen, mean_delay, jitter, drop_prob in net_cases_s2:
-        cfg_overrides_s2 = {
-            "net.mean_delay": mean_delay,
-            "net.jitter": jitter,
-            "net.drop_prob": drop_prob,
-            "sys.malicious_fraction": 0.2,
-        }
-        for mode in ["pbft", "hbbft"]:
-            for seed in SEEDS:
-                row = run_single_sim(
-                    mode=mode,
-                    scenario_id=scen,
-                    seed=seed,
-                    cfg_overrides=cfg_overrides_s2,
-                    inject_ds=False,
-                    ds_rate=0.0,
-                )
-                all_rows.append(row)
+    # ===== S3: Byzantine nặng + DS rate cao =====
+    cfg_s3 = {
+        "net.mean_delay": 1.0,
+        "net.jitter": 0.5,
+        "net.drop_prob": 0.05,
+        "sys.malicious_fraction": 0.2,
+    }
+    for mode in ["pbft", "hbbft"]:
+        for seed in SEEDS:
+            row = run_single_sim(
+                mode=mode,
+                scenario_id="S3_heavy_byz",
+                seed=seed,
+                cfg_overrides=cfg_s3,
+                inject_ds=True,
+                ds_rate=0.005,
+            )
+            all_rows.append(row)
 
-    # ========= Scenario 3: Byzantine & Double-spend stress =========
-    mal_cases = [
-        # (scenario, malicious_fraction, inject_ds, ds_rate)
-        ("S3_E", 0.0, False, 0.0),
-        ("S3_F", 0.1, True, 0.001),
-        ("S3_G", 0.2, True, 0.005),
-        ("S3_H", 0.33, True, 0.01),
-    ]
+    # ===== S4: mạng rất xấu + Byzantine trung bình =====
+    cfg_s4 = {
+        "net.mean_delay": 3.0,
+        "net.jitter": 1.5,
+        "net.drop_prob": 0.2,
+        "sys.malicious_fraction": 0.2,
+    }
+    for mode in ["pbft", "hbbft"]:
+        for seed in SEEDS:
+            row = run_single_sim(
+                mode=mode,
+                scenario_id="S4_breakdown",
+                seed=seed,
+                cfg_overrides=cfg_s4,
+                inject_ds=True,
+                ds_rate=0.005,
+            )
+            all_rows.append(row)
 
-    for scen, mal_frac, inject_ds, ds_rate in mal_cases:
-        cfg_overrides_s3 = {
-            "net.mean_delay": 1.0,   # mạng trung bình
-            "net.jitter": 0.5,
-            "net.drop_prob": 0.05,
-            "sys.malicious_fraction": mal_frac,
-        }
-        for mode in ["pbft", "hbbft"]:
-            for seed in SEEDS:
-                row = run_single_sim(
-                    mode=mode,
-                    scenario_id=scen,
-                    seed=seed,
-                    cfg_overrides=cfg_overrides_s3,
-                    inject_ds=inject_ds,
-                    ds_rate=ds_rate,
-                )
-                all_rows.append(row)
-
-    # ========= Scenario 4: Breakdown (network cực xấu) =========
-    # Mục tiêu: đẩy PBFT đến vùng no-progress, HBBFT vẫn commit được
-    net_cases_s4 = [
-        ("S4_1", 4.0, 2.0, 0.20),
-        ("S4_2", 6.0, 3.0, 0.30),
-    ]
-
-    for scen, mean_delay, jitter, drop_prob in net_cases_s4:
-        cfg_overrides_s4 = {
-            "net.mean_delay": mean_delay,
-            "net.jitter": jitter,
-            "net.drop_prob": drop_prob,
-            "sys.malicious_fraction": 0.2,
-        }
-        for mode in ["pbft", "hbbft"]:
-            for seed in SEEDS:
-                row = run_single_sim(
-                    mode=mode,
-                    scenario_id=scen,
-                    seed=seed,
-                    cfg_overrides=cfg_overrides_s4,
-                    inject_ds=True,   # ép DS mạnh hơn để stress
-                    ds_rate=0.005,
-                )
-                all_rows.append(row)
-
-    # ========= Ghi kết quả =========
     append_rows_to_csv(RESULTS_PATH, all_rows)
-    print(f"[DONE] Đã ghi {len(all_rows)} dòng kết quả vào {RESULTS_PATH}")
+    print(f"[DONE] Đã ghi {len(all_rows)} dòng vào {RESULTS_PATH}")
 
 
 if __name__ == "__main__":
