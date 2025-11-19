@@ -13,6 +13,9 @@ class Metrics:
     faulty_nodes_quarantined: int = 0
     pbft_success: int = 0
     pbft_failure: int = 0
+    
+    hbbft_success: int = 0
+    hbbft_failure: int = 0
 
     def as_dict(self) -> Dict:
         return self.__dict__.copy()
