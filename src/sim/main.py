@@ -48,6 +48,8 @@ from ..core.sorting import PrioritySorter
 from ..core.metrics import Metrics
 from ..core.workload import addr_to_shard
 from ..io.tx_reader import stream_transactions_from_csv
+from ..consensus.honeybadger_zone import HoneyBadgerZone
+
 
 
 class MSSPSim:
@@ -115,14 +117,55 @@ class MSSPSim:
             zid = "_".join(str(sid) for sid in shard_key)
             # Danh sách shard của zone là list(shard_key)
             zone_shards = list(shard_key)
-            # Khởi tạo mức ưu tiên bằng giá trị tối đa. Bài báo đề xuất đặt
-            # ưu tiên dựa trên số block hợp lệ của mỗi zone trong chu kỳ, thay vì
-            # một số ngẫu nhiên. Ở bước này, ta bắt đầu với priority_max để tất
-            # cả zone có cơ hội ngang nhau và sẽ được điều chỉnh động sau này.
+            # Khởi tạo mức ưu tiên bằng giá trị tối đa.
             self.zones[zid] = ConsensusZone(
                 self.env, zid, zone_shards, z_nodes,
                 priority=self.cfg.sort.priority_max
             )
+
+        # ================== HBBFT: khởi tạo HoneyBadger cho từng zone ==================
+        self.hbbft_zones: Dict[str, HoneyBadgerZone] = {}
+
+        # batch_size cho HBBFT: đọc từ config, nếu không có thì dùng mặc định 256
+        default_batch_size = 256
+        hbbft_batch_size = getattr(
+            getattr(self.cfg, "consensus", None),
+            "hbbft_batch_size",
+            default_batch_size
+        )
+
+        for zid, zone in self.zones.items():
+            node_ids = [n.node_id for n in zone.nodes]
+            if not node_ids:
+                continue
+
+            # f = floor((n-1)/3)
+            f = self._compute_f(len(node_ids))
+
+            # seed cho CommonCoin / ABA
+            coin_seed = getattr(
+                getattr(self.cfg, "consensus", None),
+                "hbbft_coin_seed",
+                self.cfg.sys.random_seed
+            )
+
+            # closure để "đóng" zid vào send_func (tránh bug capture biến loop)
+            def make_send(zid_local: str):
+                def _send(src_id: int, dst_id: int, msg_type: str, payload: dict):
+                    # gọi vào hàm gửi message consensus của MSSPSim
+                    self._send_consensus_msg(zid_local, src_id, dst_id, msg_type, payload)
+                return _send
+
+            hb = HoneyBadgerZone(
+                env=self.env,
+                node_ids=node_ids,
+                f=f,
+                send_func=make_send(zid),
+                coin_seed=coin_seed,
+                batch_size=hbbft_batch_size,
+            )
+            self.hbbft_zones[zid] = hb
+        # ================== HẾT KHỐI KHỞI TẠO HBBFT ==================
 
         # --- Network ---
         self.net = Network(cfg.net.mean_delay, cfg.net.jitter, cfg.net.drop_prob, cfg.net.use_topology)
@@ -140,6 +183,7 @@ class MSSPSim:
         self._ext_tx_buffer = deque()           # hàng đợi TX từ feed bên ngoài
         self._ext_tx_sink: Optional[Callable] = self._resolve_internal_tx_sink()
         self._ext_drain_started = False
+
 
     # ------------------------------------------------------------------
     # Utilities
@@ -361,80 +405,17 @@ class MSSPSim:
 
     def _process_zone_hbbft(self, zone, txs, leader, conflict_id):
         """
-        Mô phỏng 1 round HoneyBadgerBFT trong 1 consensus zone.
+        Thay vì chạy 1 ACS ad-hoc, ta:
+        - nạp txs vào mempool HBBFT của zone
+        - nếu đủ batch_size -> chạy 1 epoch HoneyBadgerBFT
+        - commit batch tx -> tạo block giống PBFT
         """
-
         env = self.env
 
-        # 0. Mô phỏng thời gian xử lý ban đầu (giống PBFT pre-processing)
+        # mô phỏng xử lý local
         yield env.timeout(self._sample_processing())
 
-        # 1. Tính n cho zone
-        n = len(zone.nodes)
-        if n == 0:
-            # không có node nào → thất bại
-            self.metrics['hbbft_failure'] += 1
-            return
-
-        # === QUAN TRỌNG: f cho HBBFT phải tính riêng, không dùng _compute_f ===
-        # Quy tắc:
-        #   - f = floor((n - 1) / 3)
-        #   - đảm bảo n >= 2f + 1 (điều kiện RBC rút gọn trong repo)
-        f = (n - 1) // 3
-        if f < 0:
-            f = 0
-        while f > 0 and n < 2 * f + 1:
-            f -= 1
-
-        # 2. Lấy danh sách node_id trong zone
-        node_ids = [n.node_id for n in zone.nodes]
-
-        # 3. Mỗi node "đề xuất" cùng một batch txs, mã hoá bằng tpke_encrypt
-        from ..consensus.tpke import tpke_encrypt, tpke_decrypt
-        proposals: Dict[int, bytes] = {}
-        for nid in node_ids:
-            ciphertext = tpke_encrypt(txs)   # trả về bytes
-            proposals[nid] = ciphertext
-
-        # 4. Khởi tạo ACS cho zone này với f đã điều chỉnh
-        from ..consensus.acs import ACS
-
-        # seed đồng xu ngẫu nhiên cho ABA, nếu không có thì fallback dùng random_seed hệ thống
-        coin_seed = getattr(getattr(self.cfg, "consensus", None), "hbbft_coin_seed",
-                            self.cfg.sys.random_seed)
-
-        acs = ACS(env, node_ids=node_ids, f=f, coin_seed=coin_seed)
-
-        # epoch có thể dùng block_counter hiện tại của zone
-        epoch = zone.block_counter
-
-        # 5. Chạy 1 epoch ACS: trả về tập sender_id được accept + payload tương ứng
-        acs_result = yield env.process(acs.run_epoch(epoch, proposals))
-
-        # 6. Giải mã tất cả payload được chấp nhận, gộp lại thành 1 list TX
-        combined_txs: List[Dict] = []
-        for sid in acs_result.accepted_sender_ids:
-            cipher = acs_result.payloads.get(sid)
-            if cipher is None:
-                continue
-            try:
-                decoded = tpke_decrypt(cipher, shares=2)  # TPKE giả lập, shares không dùng nhiều
-            except Exception:
-                # nếu giải mã lỗi thì bỏ qua đề xuất này
-                continue
-
-            # tpke_decrypt của bạn trả về list → gộp vào
-            if isinstance(decoded, list):
-                combined_txs.extend(decoded)
-            else:
-                combined_txs.append(decoded)
-
-        # Nếu không có TX nào sau khi giải mã → xem như epoch HBBFT thất bại
-        if not combined_txs:
-            self.metrics['hbbft_failure'] += 1
-            return
-
-        # 7. Tìm zone_id (zid) string tương ứng (key trong self.zones)
+        # tìm zid
         zid = None
         for key, z in self.zones.items():
             if z is zone:
@@ -444,10 +425,26 @@ class MSSPSim:
             self.metrics['hbbft_failure'] += 1
             return
 
-        # 8. Tạo block mới (giống logic PBFT nhưng tag hbbft để phân biệt)
+        hb = self.hbbft_zones.get(zid)
+        if hb is None:
+            self.metrics['hbbft_failure'] += 1
+            return
+
+        # 1) nạp txs vào mempool HBBFT của zone
+        hb.add_txs(txs)
+
+        # 2) thử chạy epoch nếu đủ B tx
+        combined_txs = yield env.process(hb.run_epoch_if_ready())
+
+        if not combined_txs:
+            # chưa đủ batch => chưa commit block; không coi là failure
+            return
+
+        # 3) giống phần tạo block của PBFT
         zone.block_counter += 1
         bid = f"{zid}_hbbft{zone.block_counter}_{int(env.now)}"
 
+        import random
         for sid in zone.shards:
             shard = self.shards[sid]
             parent = random.choice(list(shard.tips)) if shard.tips else None
@@ -455,24 +452,21 @@ class MSSPSim:
             shard.blocks[bid] = nb
             shard.tips.add(bid)
 
-        # 9. Cập nhật pre-sort double-spend nếu có conflict_id
+        # 4) DS pre-sort & post-sort như cũ
         if conflict_id:
             s = self.conflict_map.setdefault(conflict_id, set())
             s.add(bid)
             if len(s) == 2:
                 self.metrics['pre_sort_double_spends'] += 1
 
-        # 10. Broadcast update tới các node giống như PBFT
         for sid in zone.shards:
-            recipients = [n for n in self.nodes if (sid in n.stored_shards)]
+            recipients = [n for n in self.nodes if sid in n.stored_shards]
             for r in recipients:
                 env.process(self._deliver_update(r, zone, bid))
 
-        # 11. Gọi sorter để linearize như PBFT
         for sid in zone.shards:
             self.sorter.sort_and_linearize(sid)
 
-        # 12. Kiểm tra double-spend sau sort (giữ nguyên logic PBFT)
         if conflict_id and len(self.conflict_map.get(conflict_id, set())) >= 2:
             alive = 0
             for bid2 in self.conflict_map[conflict_id]:
@@ -484,7 +478,6 @@ class MSSPSim:
             if alive >= 2:
                 self.metrics['post_sort_double_spends'] += 1
 
-        # 13. Đánh dấu 1 vòng HBBFT thành công
         self.metrics['hbbft_success'] += 1
 
     def _deliver_update(self, node: Node, zone: ConsensusZone, bid: str):
@@ -519,6 +512,38 @@ class MSSPSim:
         if random.random() < p:
             self.metrics['proofs_returned'] += 1
     
+    def _send_consensus_msg(self,
+                            zid: str,
+                            src_id: int,
+                            dst_id: int,
+                            msg_type: str,
+                            payload: Any):
+        """
+        Gửi 1 thông điệp consensus (RBC/ABA/COIN/ACS) của HBBFT:
+          - Lấy delay từ Network
+          - Mô phỏng rơi gói
+          - Nếu nhận được thì chuyển tiếp vào HoneyBadgerZone tương ứng.
+        """
+        # nếu zone không có HBBFT thì bỏ
+        hb_zone = self.hbbft_zones.get(zid)
+        if hb_zone is None:
+            return
+
+        delay = self.net.sample_delay(src_id=src_id, dst_id=dst_id)
+
+        def _deliver():
+            # 1) chờ độ trễ
+            yield self.env.timeout(delay)
+
+            # 2) có thể bị drop
+            if self.net.should_drop():
+                return
+
+            # 3) chuyển message vào HBBFT của zone
+            hb_zone.on_consensus_message(src_id, dst_id, msg_type, payload)
+
+        # đăng ký process trong SimPy
+        self.env.process(_deliver())
 
 
     # ------------------------------------------------------------------

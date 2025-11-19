@@ -1,43 +1,123 @@
-from __future__ import annotations
+# src/consensus/acs.py
 import simpy
-from typing import Dict, List
-from .rbc import RBC, RBCMessage
-from .aba import ABA
+from typing import Dict, List, Any, Callable
 
-class ACSResult:
-    def __init__(self):
-        self.accepted_sender_ids: List[int] = []
-        self.payloads: Dict[int, bytes] = {}
+from .rbc import RBCInstance
+from .aba import ABAInstance
+from .coin import CommonCoin  # em phải có 1 common coin mô phỏng
+
 
 class ACS:
-    """ACS = nhiều RBC + nhiều ABA → subset chung (rút gọn)."""
-    def __init__(self, env: simpy.Environment, node_ids: List[int], f:int, coin_seed:int):
+    """
+    ACS một-shot cho 1 epoch, theo Ben-Or et al.:
+      - Mỗi node i có 1 RBC_i và 1 ABA_i
+      - Kết quả: tập con chỉ số i mà ABA_i = 1 + value RBC_i tương ứng.
+    """
+
+    def __init__(self,
+                 env: simpy.Environment,
+                 node_ids: List[int],
+                 f: int,
+                 send_func: Callable[[int, int, str, Any], None],
+                 coin_seed: int):
+
         self.env = env
         self.node_ids = node_ids
         self.f = f
-        self.rbc = RBC(env, node_ids, f)
-        self.aba = ABA(env, n=len(node_ids), f=f, seed=coin_seed)
+        self.n = len(node_ids)
+        self.send = send_func
 
-    def run_epoch(self, epoch:int, proposals: Dict[int, bytes]):
-        # “phát” RBC (mô phỏng: mọi node đều on_receive)
-        for sid, payload in proposals.items():
-            msg = RBCMessage(sender_id=sid, epoch=epoch, cid=f"{epoch}:{sid}", payload=payload)
-            for nid in self.node_ids:
-                self.rbc.on_receive(msg, from_node=nid)
+        self.coin = CommonCoin(env, node_ids, coin_seed)
 
-        accepted = []
-        for sid in proposals.keys():
-            delivered = self.rbc.is_delivered(epoch, sid)
-            init_bit = 1 if delivered else 0
-            decision = yield self.env.process(self.aba.decide(initial_bit=init_bit))
-            if decision == 1 and delivered:
-                accepted.append(sid)
+        # rbc[iid][nid] = RBCInstance (view của node nid về sender iid)
+        self.rbc: Dict[int, Dict[int, RBCInstance]] = {}
+        self.aba: Dict[int, ABAInstance] = {}
+        self.aba_input_given: Dict[int, bool] = {i: False for i in node_ids}
 
-        if len(accepted) < self.f + 1 and len(accepted) > 0:
-            accepted = accepted[: self.f + 1]
+        for sid in node_ids:
+            self.rbc[sid] = {}
+            for nid in node_ids:
+                self.rbc[sid][nid] = RBCInstance(env, sid, node_ids, f, send_func)
 
-        res = ACSResult()
-        res.accepted_sender_ids = accepted
-        for sid in accepted:
-            res.payloads[sid] = self.rbc.get_payload(epoch, sid)
-        return res
+            self.aba[sid] = ABAInstance(env,
+                                        inst_id=f"ABA_{sid}",
+                                        node_ids=node_ids,
+                                        f=f,
+                                        coin=self.coin)
+
+    # ==== interface để node i "propose" giá trị ====
+
+    def propose(self, proposer_id: int, value: Any):
+        """
+        Node proposer_id đưa value vào RBC_{proposer_id}.
+        """
+        self.rbc[proposer_id][proposer_id].sender_input(value)
+
+    def handle_message(self, from_id: int, to_id: int, msg_type: str, payload: Any):
+        """
+        Router: từ Sim/Network gọi vào đây cho message của RBC/ABA/coin.
+        Tùy msg_type prefix mà chuyển tiếp.
+        """
+        if msg_type.startswith("RBC_"):
+            sid = payload.get("sid")
+            if sid in self.rbc:
+                self.rbc[sid][to_id].handle_message(from_id, msg_type, payload)
+
+        elif msg_type.startswith("ABA_"):
+            # em tự định nghĩa format msg_type/payload cho ABA
+            inst = self.aba.get(payload.get("inst"))
+            if inst:
+                inst.handle_message(from_id, msg_type, payload)
+
+        elif msg_type.startswith("COIN_"):
+            self.coin.handle_message(from_id, msg_type, payload)
+
+    def _maybe_feed_aba_inputs(self):
+        """
+        Triển khai đúng ý Ben-Or:
+          - Khi một RBC_j của node i deliver value lần đầu => ABA_j input 1
+          - Khi đã có >= N-f ABA = 1, thì các ABA chưa input => input 0
+        (Ở đây ta xét từ góc nhìn "zone controller", tương đương 1 node).
+        """
+        # 1) check RBC deliver -> ABA input 1
+        delivered_indices = []
+        for sid in self.node_ids:
+            inst = self.rbc[sid][sid]  # nhìn từ sender chính
+            if inst.is_ready_to_deliver() and not self.aba_input_given[sid]:
+                self.aba[sid].input(1)
+                self.aba_input_given[sid] = True
+                delivered_indices.append(sid)
+
+        # 2) nếu đã >= N-f ABA=1 -> feed 0 cho các ABA còn lại
+        yes_count = sum(
+            1 for sid in self.node_ids
+            if self.aba_input_given[sid] and self.aba[sid].has_output() and self.aba[sid].get_output() == 1
+        )
+        if yes_count >= self.n - self.f:
+            for sid in self.node_ids:
+                if not self.aba_input_given[sid]:
+                    self.aba[sid].input(0)
+                    self.aba_input_given[sid] = True
+
+    def run_epoch(self) -> Dict[int, Any]:
+        """
+        Tiến hành cho đến khi TẤT CẢ ABA_i đều có output.
+        Trả về map sid -> value đã RBC-delivered (chỉ với sid mà ABA_i=1).
+        """
+        while True:
+            yield self.env.timeout(0.01)
+            self._maybe_feed_aba_inputs()
+
+            if all(self.aba[sid].has_output() for sid in self.node_ids):
+                break
+
+        chosen: Dict[int, Any] = {}
+        for sid in self.node_ids:
+            if self.aba[sid].get_output() == 1:
+                val = None
+                # mỗi node có view RBC riêng, ở đây lấy view của sender chính cho đơn giản
+                inst = self.rbc[sid][sid]
+                if inst.is_ready_to_deliver():
+                    val = inst.get_delivered_value()
+                chosen[sid] = val
+        return chosen
