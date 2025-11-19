@@ -513,6 +513,32 @@ class MSSPSim:
             self.metrics['proofs_returned'] += 1
     
 
+    # ------------------------------------------------------------------
+    # Consensus message delivery for HBBFT/RBC/ABA
+    # ------------------------------------------------------------------
+    def _send_consensus_msg(self, zid_local: str, src_id: int, dst_id: int,
+                            msg_type: str, payload: dict):
+        """
+        Deliver a consensus message between two nodes in a zone using the
+        network model. HBBFT calls this via a closure in HoneyBadgerZone.
+        """
+        def _deliver():
+            # 1) Lấy ngẫu nhiên độ trễ mạng giữa src và dst
+            delay = self.net.sample_delay(src_id=src_id, dst_id=dst_id)
+            # 2) Chờ thời gian delay theo SimPy
+            yield self.env.timeout(delay)
+            # 3) Kiểm tra có bị rớt gói không
+            if self.net.should_drop():
+                return
+            # 4) Tìm HoneyBadgerZone của zone tương ứng
+            hb = self.hbbft_zones.get(zid_local)
+            if hb is None:
+                return
+            # 5) Gửi message tới HoneyBadgerZone để nó xử lý (RBC/ABA)
+            hb.on_consensus_message(src_id, dst_id, msg_type, payload)
+
+        # Lên lịch tiến trình gửi message trong môi trường SimPy
+        self.env.process(_deliver())
 
     # ------------------------------------------------------------------
     # CSV feed tại chỗ (tuỳ chọn) — nếu muốn nạp trực tiếp trong class
