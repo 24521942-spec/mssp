@@ -1,7 +1,22 @@
-# src/consensus/honeybadger_zone.py
+"""
+HoneyBadgerZone quản lý một vùng đồng thuận của giao thức HoneyBadgerBFT.
+
+Đối với mỗi zone (được xác định bởi tập shard mà các node lưu trữ),
+HoneyBadgerZone duy trì mempool, trạng thái TPKE và một ACS đang hoạt
+động (nếu có). Khi mempool có đủ batch tx, zone sẽ khởi động một epoch
+ACS: mã hoá đề xuất, broadcast qua RBC, quyết định bit vector bằng ABA,
+kết hợp ciphertext và giải mã, cuối cùng sinh ra block và xoá tx khỏi
+mempool.
+
+Điểm khác biệt so với mã ban đầu:
+    - tpke_encrypt và tpke_decrypt không tự chèn timeout, do đó hàm
+      run_epoch_if_ready bổ sung env.timeout để mô phỏng chi phí mã hoá/
+      giải mã.
+"""
+
 import random
 import simpy
-from typing import List, Dict, Any, Callable, Optional  # <-- thêm Optional
+from typing import List, Dict, Any, Callable, Optional
 
 from .tpke import tpke_setup, tpke_encrypt, tpke_dec_share, tpke_decrypt
 from .acs import ACS
@@ -50,8 +65,9 @@ class HoneyBadgerZone:
 
     def _select_proposals(self) -> Dict[int, List[Dict]]:
         """
-        Mỗi node chọn ngẫu nhiên ~B/N tx từ B tx đầu tiên trong mempool (paper Section 4.3).
-        Ở đây ta làm đơn giản: tất cả node cùng nhìn 1 mempool chia đều.
+        Mỗi node chọn ngẫu nhiên ~B/N tx từ B tx đầu tiên trong mempool
+        (paper Section 4.3). Ở đây ta làm đơn giản: tất cả node cùng nhìn
+        1 mempool chia đều.
         """
         if len(self.mempool) < self.batch_size:
             return {}
@@ -80,14 +96,17 @@ class HoneyBadgerZone:
           + sau khi xong thì self._active_acs = None.
         - Trong thời gian ACS đang chạy, mọi message consensus đi qua network
           sẽ được MSSPSim gọi vào on_consensus_message() để self._active_acs xử lý.
+        - Hàm sử dụng yield env.timeout để mô phỏng chi phí mã hoá/giải mã.
         """
         proposals = self._select_proposals()
         if not proposals:
             return None
 
-        # 1. Encrypt
+        # 1. Encrypt: mô phỏng chi phí mã hoá bằng env.timeout
         encrypted: Dict[int, bytes] = {}
         for nid, plist in proposals.items():
+            # thời gian mã hoá tỷ lệ với số tx? ở đây dùng hằng số nhỏ
+            yield self.env.timeout(0.005)
             ct = tpke_encrypt(self.pk, plist)
             encrypted[nid] = ct
 
@@ -110,7 +129,7 @@ class HoneyBadgerZone:
         # Epoch kết thúc -> clear active_acs
         self._active_acs = None
 
-        # 4. Decrypt các ciphertext được chấp nhận
+        # 4. Decrypt các ciphertext được chấp nhận, mô phỏng chi phí dec_share và decrypt
         combined: List[Dict] = []
         for sid, ct in chosen.items():
             if ct is None:
@@ -119,9 +138,13 @@ class HoneyBadgerZone:
             # thu thập share từ tất cả node (ở mô phỏng: từ sk_shares)
             shares = []
             for nid in self.node_ids:
+                # mô phỏng chi phí tạo dec_share
+                yield self.env.timeout(0.002)
                 share = tpke_dec_share(self.sk_shares[nid], ct)
                 shares.append(share)
             try:
+                # mô phỏng chi phí decrypt
+                yield self.env.timeout(0.005)
                 decoded_list = tpke_decrypt(self.pk, shares)
             except Exception:
                 continue
@@ -138,10 +161,10 @@ class HoneyBadgerZone:
         return combined
 
     def on_consensus_message(self,
-                             src_id: int,
-                             dst_id: int,
-                             msg_type: str,
-                             payload: Any):
+                              src_id: int,
+                              dst_id: int,
+                              msg_type: str,
+                              payload: Any):
         """
         Hàm này được MSSPSim gọi khi 1 message consensus (RBC/ABA/COIN/ACS)
         tới zone sau khi đi qua network.
@@ -151,6 +174,5 @@ class HoneyBadgerZone:
         if self._active_acs is None:
             # Không có epoch nào đang chạy -> bỏ message
             return
-
         # chuyển tiếp vào ACS để nó route tới RBC/ABA/COIN tương ứng
         self._active_acs.handle_message(src_id, dst_id, msg_type, payload)

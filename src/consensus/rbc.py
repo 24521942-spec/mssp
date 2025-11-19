@@ -1,12 +1,27 @@
-# src/consensus/rbc.py
+"""
+Reliable Broadcast (RBC) mô phỏng dựa theo thuật toán Bracha.
+
+Mỗi phiên RBC được xác định bởi một sender (sid). Mỗi node có một
+RBCInstance riêng cho mỗi sender để theo dõi trạng thái broadcast từ
+sender đó. Thuật toán gồm ba loại thông điệp: VAL, ECHO và READY.
+Mục đích là đảm bảo rằng nếu một node đúng đắn deliver giá trị v thì
+tất cả các node đúng đắn khác cuối cùng cũng deliver cùng giá trị đó.
+
+Trong mô phỏng này chúng ta không sử dụng erasure coding để giảm
+chi phí truyền, nhưng vẫn giữ ngưỡng N−f đối với ECHO và 2f+1 đối
+với READY theo thuật toán gốc.
+"""
+
 import simpy
-from typing import Dict, Any, List, Set, Callable
+from typing import Dict, Any, List, Callable
 
 
 class RBCInstance:
     """
     Mô phỏng Reliable Broadcast của 1 sender (id = sid) cho 1 giá trị v.
-    Kiểu Bracha + erasure-code rút gọn: ta giả lập thông điệp, không cần Merkle tree.
+    Kiểu Bracha + erasure-code rút gọn: ta giả lập thông điệp, không cần
+    Merkle tree. Mỗi node giữ một instance riêng để xử lý thông điệp
+    gửi đến.
     """
 
     def __init__(self,
@@ -16,8 +31,12 @@ class RBCInstance:
                  f: int,
                  send_func: Callable[[int, int, str, Any], None]):
         """
-        :param send_func: hàm send(src_id, dst_id, msg_type, payload),
-                          MSSPSim sẽ bọc sang Network.sample_delay().
+        Args:
+            env (simpy.Environment): môi trường mô phỏng.
+            sid (int): id của sender.
+            node_ids (List[int]): danh sách id node tham gia.
+            f (int): số lượng kẻ xấu tối đa.
+            send_func (Callable): hàm gửi message (src_id, dst_id, msg_type, payload).
         """
         self.env = env
         self.sid = sid
@@ -27,8 +46,8 @@ class RBCInstance:
         self.send = send_func
 
         # trạng thái local
-        self.echo_recv: Dict[int, Any] = {}   # from nid -> value
-        self.ready_recv: Dict[int, Any] = {}  # from nid -> value
+        self.echo_recv: Dict[int, Any] = {}   # từ nid -> value
+        self.ready_recv: Dict[int, Any] = {}  # từ nid -> value
 
         self.value = None
         self.delivered = False
@@ -47,6 +66,7 @@ class RBCInstance:
 
     # Giao diện phía node nhận
     def handle_message(self, from_id: int, msg_type: str, payload: Dict):
+        # kiểm tra xem payload có thuộc phiên RBC này hay không
         if payload.get("sid") != self.sid:
             return
         v = payload.get("v")
@@ -78,7 +98,6 @@ class RBCInstance:
         """
         if self.delivered:
             return True
-
         counts: Dict[str, int] = {}
         for vv in self.ready_recv.values():
             key = repr(vv)
