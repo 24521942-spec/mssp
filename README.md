@@ -1,93 +1,479 @@
-# mssp_own
+# 🔗 MSSP — Multi-Shard Security Protocol Simulation
 
+A discrete-event blockchain simulation for evaluating **double-spending attack resistance** in sharded environments, comparing **PBFT** and **HoneyBadgerBFT (HBBFT)** consensus under adversarial conditions.
 
+> **Research focus:** Validate MSSP's fault-tolerance guarantees — specifically the Priority Sorter's ability to linearize cross-shard forks and reduce post-consensus double-spends to zero under Byzantine node conditions.
 
-## Getting started
+---
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## 📋 Table of Contents
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Running Experiments](#running-experiments)
+- [Metrics & Output](#metrics--output)
+- [Module Reference](#module-reference)
 
-## Add your files
+---
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## Overview
+
+MSSP (Multi-Shard Security Protocol) partitions a blockchain network into shards. Nodes are divided into:
+
+| Node Type | Description |
+|-----------|-------------|
+| **s-node** | Standard node — stores data for exactly 1 shard |
+| **m-node** | Multi-shard node — stores data for `k` shards, selected via SHA-256 hashing |
+
+**Consensus Zones** are formed by grouping nodes that share the same shard-set. Each zone runs its own consensus round independently (PBFT or HBBFT), then the **Priority Sorter** linearizes competing forks across the entire network to detect and eliminate double-spend conflicts.
+
+### What This Simulation Measures
+
+| Metric | Description |
+|--------|-------------|
+| `pre_sort_double_spends` | Number of conflicting TX pairs before sorting |
+| `post_sort_double_spends` | Surviving conflicts **after** the Priority Sorter runs |
+| `pbft_success / pbft_failure` | PBFT consensus outcomes per zone |
+| `hbbft_success / hbbft_failure` | HBBFT epoch outcomes per zone |
+| `orphaned_blocks` | Losing-fork blocks discarded by the sorter |
+| `confirmed_blocks` | Blocks accepted into the canonical chain |
+| `faulty_nodes_quarantined` | Nodes removed via P-probability mechanism |
+
+---
+
+## Architecture
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/24521942/mssp_own.git
-git branch -M main
-git push -uf origin main
+                    ┌──────────────────────────────────────┐
+                    │             MSSPSim                  │
+                    │                                      │
+   CSV / Attacker ──► accept_tx() ──► _ingest_tx()        │
+                    │        │                             │
+                    │        ▼                             │
+                    │   addr_to_shard()  ──►  Zone lookup  │
+                    │                             │        │
+                    │              ┌──────────────┘        │
+                    │              ▼                       │
+                    │    process_zone(zid, txs)            │
+                    │         │            │               │
+                    │    [PBFT mode]  [HBBFT mode]         │
+                    │         │            │               │
+                    │    run_pbft()   HoneyBadgerZone      │
+                    │         │       ├── ACS              │
+                    │         │       │   ├── RBC (Bracha) │
+                    │         │       │   └── ABA          │
+                    │         │       └── TPKE encrypt/dec │
+                    │         │            │               │
+                    │         └────────────┘               │
+                    │                  │                   │
+                    │           Block created              │
+                    │                  │                   │
+                    │        PrioritySorter                │
+                    │   sort_and_linearize(shard_id)       │
+                    │   ├── Pick highest-priority tip      │
+                    │   ├── Confirm canonical chain        │
+                    │   ├── Orphan competing forks         │
+                    │   └── Cross-shard conflict detection │
+                    │                  │                   │
+                    │            Metrics update            │
+                    └──────────────────────────────────────┘
 ```
 
-## Integrate with your tools
+### Consensus Flow (PBFT)
 
-- [ ] [Set up project integrations](https://gitlab.com/24521942/mssp_own/-/settings/integrations)
+```
+Leader ──► PRE-PREPARE ──► PREPARE (need 2f+1 votes)
+                                  │
+                         quorum? ─┴─ no ──► View-Change ──► retry (max N times)
+                                  │
+                                 yes
+                                  │
+                            COMMIT (need 2f+1 votes) ──► Block created
+```
 
-## Collaborate with your team
+### Consensus Flow (HoneyBadgerBFT)
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+```
+Mempool >= batch_size B transactions
+        │
+        ▼
+TPKE Encrypt (each node encrypts its B/N proposal)
+        │
+        ▼
+ACS (Atomic Common Subset)
+  ├── RBC_i (Bracha Reliable Broadcast) × N
+  └── ABA_i (Asynchronous Binary Agreement) × N
+        │
+        ▼
+TPKE Decrypt (combine f+1 shares to recover proposals)
+        │
+        ▼
+Block committed → Priority Sorter runs
+```
 
-## Test and Deploy
+---
 
-Use the built-in continuous integration in GitLab.
+## Project Structure
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+```
+mssp_own/
+│
+├── run.py                        # Quick single run (PBFT, 200k TX)
+├── run_pbft.py                   # Run PBFT with custom parameters
+├── run_hbbft.py                  # Run HBBFT with CLI args
+├── run_experiment.py             # Full comparative experiment (4 scenarios × 2 modes × 5 seeds)
+│
+├── data/
+│   └── blockchain_transaction.csv  # Input transaction dataset (~1.7 GB)
+│
+├── ds_results.csv                # Output: experiment results (auto-generated)
+│
+└── src/
+    ├── core/
+    │   ├── config.py             # All configuration dataclasses
+    │   ├── models.py             # Data models: Block, Shard, Node, ConsensusZone
+    │   ├── metrics.py            # Metrics dataclass
+    │   ├── network.py            # Network simulator (topology + latency + drop)
+    │   ├── pbft.py               # PBFT 3-phase protocol with view-change
+    │   ├── sorting.py            # PrioritySorter — linearization + auto-tuning
+    │   └── workload.py           # Attacker process + address→shard mapping
+    │
+    ├── consensus/
+    │   ├── honeybadger_zone.py   # HoneyBadgerBFT zone controller
+    │   ├── acs.py                # Atomic Common Subset (ACS)
+    │   ├── rbc.py                # Reliable Broadcast (Bracha algorithm)
+    │   ├── aba.py                # Asynchronous Binary Agreement
+    │   ├── coin.py               # Common Coin (shared randomness)
+    │   └── tpke.py               # Threshold Public Key Encryption (simulated)
+    │
+    ├── io/
+    │   └── tx_reader.py          # Streaming CSV reader + double-spend injector
+    │
+    ├── sim/
+    │   └── main.py               # MSSPSim — top-level simulation orchestrator
+    │
+    └── experiments/
+        └── analysis_plot.py      # Heatmap + bar chart generators (seaborn)
+```
 
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+---
 
 ## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+### Requirements
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+- Python **3.9+**
+- ~2 GB disk space for the transaction dataset
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+### Install dependencies
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+```bash
+pip install simpy pandas networkx matplotlib seaborn
+```
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+Or with a `requirements.txt`:
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+```bash
+pip install -r requirements.txt
+```
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+**`requirements.txt`:**
+```
+simpy>=4.0
+pandas>=1.5
+networkx>=2.8
+matplotlib>=3.6
+seaborn>=0.12
+pyarrow          # optional but recommended — faster CSV parsing
+```
 
-## License
-For open source projects, say how it is licensed.
+### Dataset
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Place the transaction CSV file at:
+```
+data/blockchain_transaction.csv
+```
+
+The file should have columns matching any of these names (auto-detected):
+
+| Field | Accepted column names |
+|-------|-----------------------|
+| Transaction hash | `tx_hash`, `hash`, `txid`, `transaction_hash` |
+| Sender | `from`, `sender`, `from_address` |
+| Receiver | `to`, `receiver`, `to_address` |
+| Amount | `value`, `amount` |
+| Timestamp | `timestamp`, `time`, `block_time`, `datetime` |
+
+---
+
+## Quick Start
+
+### Run a basic PBFT simulation
+
+```bash
+python run_pbft.py
+```
+
+This runs PBFT with 50,000 transactions, 1% double-spend injection rate, for 180 simulation time units.
+
+### Run HBBFT simulation
+
+```bash
+python run_hbbft.py
+```
+
+With custom parameters:
+
+```bash
+python run_hbbft.py --duration 120 --max-tx 10000 --inject-ds --ds-rate 0.005
+```
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--duration` | `60.0` | Simulation time (SimPy units) |
+| `--csv-path` | `data/blockchain_transaction.csv` | Input CSV file |
+| `--max-tx` | `5000` | Max transactions to load |
+| `--sample-rate` | `1.0` | Fraction of CSV rows to use (0–1) |
+| `--inject-ds` | off | Enable double-spend injection |
+| `--ds-rate` | `0.001` | Probability of injecting DS per transaction |
+
+### Run comparative experiments
+
+```bash
+python run_experiment.py
+```
+
+Runs 4 scenarios × 2 consensus modes (PBFT + HBBFT) × 5 seeds = **40 simulation runs**.
+Results are saved to `ds_results.csv`.
+
+---
+
+## Configuration
+
+All simulation parameters are defined in `src/core/config.py`.
+
+### System Config (`cfg.sys`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `shards` | `4` | Number of shards in the network |
+| `nodes_per_shard` | `8` | Nodes assigned to each shard |
+| `malicious_fraction` | `0.20` | Fraction of Byzantine nodes (must be < 1/3 for BFT safety) |
+| `malicious_drop_prob` | `0.40` | Probability a Byzantine node drops its vote |
+| `mnode_shard_count` | `2` | `k` — number of shards each m-node stores |
+| `mnode_count_per_shard` | `0` | `m` — fixed m-node count per shard (0 = use `mnode_fraction`) |
+| `mnode_fraction` | `0.40` | Fallback: fraction of nodes that become m-nodes |
+| `random_seed` | `2025` | Global random seed for reproducibility |
+
+### Consensus Config (`cfg.consensus`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `mode` | `"pbft"` | Consensus algorithm: `"pbft"` or `"hbbft"` |
+| `batch_size` | `200` | Transactions per block (PBFT) |
+| `hbbft_max_parallel` | `16` | Max parallel HBBFT instances |
+| `hbbft_coin_seed` | `2025` | Seed for Common Coin randomness |
+
+### PBFT Config (`cfg.pbft`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `timeout` | `0.80` | Phase timeout before view-change |
+| `max_view_changes` | `3` | Max retries before declaring failure |
+| `preprepare_mean` | `0.10` | Mean delay for PRE-PREPARE phase |
+| `prepare_mean` | `0.20` | Mean delay for PREPARE phase |
+| `commit_mean` | `0.20` | Mean delay for COMMIT phase |
+
+### Network Config (`cfg.net`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `mean_delay` | `0.50` | Base network latency |
+| `jitter` | `0.20` | Latency variation (±fraction) |
+| `drop_prob` | `0.00` | Packet drop probability |
+| `use_topology` | `True` | Use graph topology for realistic latency |
+
+### Sorting Config (`cfg.sort`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `priority_min` | `0` | Minimum zone priority |
+| `priority_max` | `10` | Maximum zone priority (reset target on high confirm rate) |
+| `required_confirms` | `2` | Confirms per cycle to reset priority to max |
+| `cycle_blocks` | `10` | Blocks per auto-tune cycle |
+
+### Attack Config (`cfg.atk`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ds_interval` | `3.0` | Interval between attacker double-spend injections |
+| `tx_value` | `1` | Value of each conflicting transaction |
+
+---
+
+## Running Experiments
+
+### Experiment Scenarios (`run_experiment.py`)
+
+| Scenario | Byzantine fraction | Network | DS rate | Description |
+|----------|--------------------|---------|---------|-------------|
+| `S1_baseline` | 0% | Good (delay=0.5) | None | Clean network, no attacks |
+| `S2_light_byz` | 10% | Moderate (delay=1.0) | 0.1% | Light Byzantine + occasional DS |
+| `S3_heavy_byz` | 20% | Moderate (delay=1.0) | 0.5% | Heavy Byzantine + frequent DS |
+| `S4_breakdown` | 20% | Poor (delay=3.0, drop=20%) | 0.5% | Network degradation stress test |
+
+Each scenario runs 5 seeds per mode (PBFT + HBBFT) for statistical stability.
+
+### Output CSV columns
+
+```
+scenario, mode, seed, duration, max_tx,
+sys.shards, sys.nodes_per_shard, sys.malicious_fraction,
+net.mean_delay, net.jitter, net.drop_prob,
+inject_ds, ds_rate,
+metrics.pre_sort_double_spends,
+metrics.post_sort_double_spends,
+metrics.pbft_success, metrics.pbft_failure,
+metrics.hbbft_success, metrics.hbbft_failure,
+metrics.orphaned_blocks, metrics.confirmed_blocks,
+metrics.faulty_nodes_quarantined,
+metrics.proofs_required, metrics.proofs_returned
+```
+
+### Generate plots
+
+```bash
+python src/experiments/analysis_plot.py
+```
+
+Produces:
+- `heatmap_postds.png` — Post-sort double-spends vs (network delay × process delay)
+- `pbft_bar.png` — PBFT success/failure rate vs Byzantine fraction
+
+---
+
+## Metrics & Output
+
+### Reading results from `run_pbft.py` / `run_hbbft.py`
+
+```
+=== METRICS (HBBFT) ===
+pre_sort_double_spends         42
+post_sort_double_spends         0     ← sorter eliminated all conflicts
+orphaned_blocks               38
+confirmed_blocks             312
+pbft_success                   0
+pbft_failure                   0
+hbbft_success                 28
+hbbft_failure                  2
+faulty_nodes_quarantined        3
+proofs_required              150
+proofs_returned               12
+```
+
+### Interpreting key metrics
+
+| Metric | Good result | Bad result |
+|--------|-------------|------------|
+| `post_sort_double_spends` | `0` — sorter eliminated all conflicts | `> 0` — double-spend survived |
+| `pbft_failure` | Low relative to `pbft_success` | High — Byzantine nodes blocking consensus |
+| `faulty_nodes_quarantined` | Proportional to `malicious_fraction` | 0 — P-probability not triggering |
+| `orphaned_blocks` | Present — indicates forks detected and resolved | 0 with DS — sorter may not be running |
+
+---
+
+## Module Reference
+
+### `MSSPSim` (`src/sim/main.py`)
+
+The main simulation orchestrator.
+
+```python
+from src.core.config import Config
+from src.sim.main import MSSPSim
+
+cfg = Config()
+cfg.consensus.mode = "pbft"     # or "hbbft"
+cfg.sys.shards = 4
+cfg.sys.malicious_fraction = 0.2
+
+sim = MSSPSim(cfg)
+
+# Feed transactions from CSV
+sim.feed_transactions_from_csv_local(
+    "data/blockchain_transaction.csv",
+    max_tx=50_000,
+    sample_rate=1.0,
+    inject_ds=True,
+    ds_rate=0.01
+)
+
+# Or inject single transactions directly
+sim.accept_tx({"from": "addr_A", "to": "addr_B", "value": "1"})
+
+# Run simulation
+sim.run(duration=60)
+
+# Print results
+sim.dump_metrics()
+print(sim.metrics)
+```
+
+### `PrioritySorter` (`src/core/sorting.py`)
+
+Linearizes competing forks using zone priority scores. Auto-tunes priority based on confirmed-block rate per cycle.
+
+- Selects the highest-priority tip per shard
+- Confirms the canonical chain back to genesis
+- Orphans all competing tips
+- Detects cross-shard conflicts via `conflict_map` and orphans duplicates globally
+
+### `HoneyBadgerZone` (`src/consensus/honeybadger_zone.py`)
+
+Manages one HBBFT consensus zone:
+1. Accumulates transactions in a mempool
+2. When `mempool >= batch_size`: encrypts proposals with TPKE, runs ACS
+3. ACS coordinates RBC (Bracha reliable broadcast) + ABA (async binary agreement)
+4. Decrypts results using threshold key shares, commits a block
+
+### `Network` (`src/core/network.py`)
+
+Simulates message propagation:
+- Random geometric graph topology with configurable average degree
+- Shortest-path latency with per-edge weights
+- Exponential base delay + uniform jitter
+- Probabilistic packet drop
+
+### `tx_reader` (`src/io/tx_reader.py`)
+
+Memory-safe streaming CSV reader for large files (tested up to 1.7 GB):
+- Chunk-based reading (default 50,000 rows/chunk)
+- Auto-detects column names from multiple naming conventions
+- Optional sampling (`sample_rate`)
+- Cross-zone double-spend injection: forces conflicting TX pair to target **different shards** via address manipulation
+
+---
+
+## Key Design Decisions
+
+**Why cross-zone double-spend injection?**
+Intra-zone DS is trivially caught by PBFT. Cross-zone DS — where conflicting TX land in different consensus zones — is the hard case MSSP is designed to handle. The sorter's global `conflict_map` ensures both blocks are never simultaneously confirmed.
+
+**Why SHA-256 for m-node shard selection?**
+Consistent with the MSSP paper (Algorithm 1). The hash of `(node_id ‖ R)` determines which additional shards a multi-shard node stores, ensuring uniform distribution without coordination.
+
+**Why SimPy discrete-event simulation?**
+Allows precise modeling of network delays, timeouts, concurrent consensus rounds, and view-changes without the overhead of real distributed systems. All timing is reproducible via `random_seed`.
+
+---
+
+## Author
+
+**To Dang Minh Tuan**
+- GitLab: [gitlab.com/24521942/mssp_own](https://gitlab.com/24521942/mssp_own)
+- GitHub: [github.com/tuanwannafly](https://github.com/tuanwannafly)
+- Email: totuanforwork@gmail.com
